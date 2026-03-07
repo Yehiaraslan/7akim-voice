@@ -1,0 +1,3 @@
+# Exclude user config with WiFi passwords and API keys
+user_config.h
+# Keep a template instead
