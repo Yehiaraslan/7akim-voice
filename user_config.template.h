@@ -31,4 +31,9 @@
 #define MAX_REC_SECONDS 10
 #define AUDIO_BUF_SIZE  (SAMPLE_RATE * (BIT_DEPTH/8) * MAX_REC_SECONDS)  // 320KB
 
+// ─── Wake word settings ──────────────────────────────
+// After "Jarvis" is detected, auto-stop recording after this many ms
+// Increase if you need longer commands, decrease for snappier response
+#define WAKEWORD_REC_TIMEOUT_MS  5000
+
 #endif
