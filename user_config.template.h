@@ -34,6 +34,6 @@
 // ─── Wake word settings ──────────────────────────────
 // After "Jarvis" is detected, auto-stop recording after this many ms
 // Increase if you need longer commands, decrease for snappier response
-#define WAKEWORD_REC_TIMEOUT_MS  5000
+#define WAKEWORD_REC_TIMEOUT_MS  10000
 
 #endif
