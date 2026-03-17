@@ -20,15 +20,15 @@
 extern "C" {
 #endif 
 
-static bool example_notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx);
-static void example_lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map);
+bool example_notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx);
+void example_lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map);
 void example_lvgl_rounder_cb(struct _lv_disp_drv_t *disp_drv, lv_area_t *area);
-static void example_increase_lvgl_tick(void *arg);
-static void example_lvgl_port_task(void *arg);
+void example_increase_lvgl_tick(void *arg);
+void example_lvgl_port_task(void *arg);
 void lvgl_acquire(void);
 void lvgl_release(void);
 void lcd_lvgl_Init(void);
-static void example_lvgl_touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data);
+void example_lvgl_touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data);
 #ifdef __cplusplus
 }
 #endif

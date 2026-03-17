@@ -298,7 +298,7 @@ void lcd_lvgl_Init(void)
   }
 }
 
-static bool example_lvgl_lock(int timeout_ms)
+bool example_lvgl_lock(int timeout_ms)
 {
   assert(lvgl_mux && "bsp_display_start must be called first");
 
@@ -306,12 +306,12 @@ static bool example_lvgl_lock(int timeout_ms)
   return xSemaphoreTake(lvgl_mux, timeout_ticks) == pdTRUE;
 }
 
-static void example_lvgl_unlock(void)
+void example_lvgl_unlock(void)
 {
   assert(lvgl_mux && "bsp_display_start must be called first");
   xSemaphoreGive(lvgl_mux);
 }
-static void example_lvgl_port_task(void *arg)
+void example_lvgl_port_task(void *arg)
 {
   uint32_t task_delay_ms = EXAMPLE_LVGL_TASK_MAX_DELAY_MS;
   for(;;)
@@ -333,17 +333,17 @@ static void example_lvgl_port_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(task_delay_ms));
   }
 }
-static void example_increase_lvgl_tick(void *arg)
+void example_increase_lvgl_tick(void *arg)
 {
   lv_tick_inc(EXAMPLE_LVGL_TICK_PERIOD_MS);
 }
-static bool example_notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx)
+bool example_notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx)
 {
   lv_disp_drv_t *disp_driver = (lv_disp_drv_t *)user_ctx;
   lv_disp_flush_ready(disp_driver);
   return false;
 }
-static void example_lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
+void example_lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
 {
   esp_lcd_panel_handle_t panel_handle = (esp_lcd_panel_handle_t) drv->user_data;
   const int offsetx1 = area->x1;
@@ -371,7 +371,7 @@ void example_lvgl_rounder_cb(struct _lv_disp_drv_t *disp_drv, lv_area_t *area)
 void lvgl_acquire(void) { example_lvgl_lock(-1); }
 void lvgl_release(void) { example_lvgl_unlock(); }
 
-static void example_lvgl_touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
+void example_lvgl_touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
 {
   uint16_t tp_x,tp_y;
   uint8_t win = getTouch(&tp_x,&tp_y);

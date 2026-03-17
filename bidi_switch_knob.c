@@ -167,8 +167,10 @@ esp_err_t iot_knob_delete(knob_handle_t knob_handle)
     esp_err_t ret = ESP_OK;
     KNOB_CHECK(NULL != knob_handle, "Pointer of handle is invalid", ESP_ERR_INVALID_ARG);
     knob_dev_t *knob = (knob_dev_t *)knob_handle;
-    ret = knob_gpio_deinit((int)(knob->usr_data));
-    KNOB_CHECK(ESP_OK == ret, "knob deinit failed", ESP_FAIL);
+    ret = knob_gpio_deinit((uint32_t)(long)(knob->encoder_a));
+    KNOB_CHECK(ESP_OK == ret, "knob encoder A deinit failed", ESP_FAIL);
+    ret = knob_gpio_deinit((uint32_t)(long)(knob->encoder_b));
+    KNOB_CHECK(ESP_OK == ret, "knob encoder B deinit failed", ESP_FAIL);
     knob_dev_t **curr;
     for (curr = &s_head_handle; *curr;)
     {

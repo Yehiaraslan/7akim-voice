@@ -192,7 +192,7 @@ static esp_err_t panel_sh8601_reset(esp_lcd_panel_t *panel)
 static const sh8601_lcd_init_cmd_t vendor_specific_init_default[] = {
 //  {cmd, { data }, data_size, delay_ms}
     {0x44, (uint8_t []){0x01, 0xD1}, 2, 0},
-    {0x35, (uint8_t []){0x00}, 0, 0},
+    {0x35, (uint8_t []){0x00}, 1, 0},
     {0x53, (uint8_t []){0x20}, 1, 25},
 };
 
