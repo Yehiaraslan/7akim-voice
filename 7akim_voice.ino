@@ -1,13 +1,18 @@
 /*
- * 7akim Voice Assistant v2.0 — ESP32-S3 Knob Display
+ * 7akim Voice Assistant v2.1 — ESP32-S3 Knob Display
  * Waveshare ESP32-S3-Knob-Touch-LCD-1.8
  * fqbn: esp32:esp32:esp32s3:PSRAM=opi,FlashMode=dio,FlashSize=16M,PartitionScheme=esp_sr_16,USBMode=default,CPUFreq=240
  *
- * Wake word: "Jarvis" (on-device WakeNet9, ~300ms latency)
+ * Wake word: "Jarvis" (on-device WakeNet9 only — no MultiNet)
  * Fallback: Touch screen button (hold to record, release to send)
  * Knob: Volume control (rotary encoder)
- * UI: Animated Jarvis-style interface with pulsing rings
+ * UI: Clean minimal design — single cyan ring, centered text, pill button
  * Backend: Voice server with Home Assistant integration
+ *
+ * v2.1 fixes:
+ *   - Removed MultiNet command recognition (was crashing on invalid commands)
+ *   - WakeNet-only mode: just wake word detection, no on-device commands
+ *   - Redesigned UI to match reference: single ring, clean layout, pill button
  */
 
 #include <WiFi.h>
@@ -26,26 +31,24 @@
 #include "lcd_config.h"
 #include "user_config.h"
 
-// ─── ESP_SR (WakeNet) ────────────────────────────────
+// ─── ESP_SR (WakeNet only — no MultiNet) ─────────────
 #include <ESP_I2S.h>
 #include <ESP_SR.h>
 
-static const sr_cmd_t sr_commands[] = {
-  {0, "Turn on the light"},
-  {1, "Turn off the light"},
-};
+// Empty command list — WakeNet only, no MultiNet commands
+static const sr_cmd_t sr_commands[] = {};
 
 I2SClass i2s_mic;
 
 // ─── State ───────────────────────────────────────────
 typedef enum {
-  STATE_BOOT,         // Boot animation
-  STATE_LISTENING,    // WakeNet listening for "Jarvis"
-  STATE_RECORDING,    // Recording user's voice command
-  STATE_PROCESSING,   // Sending to server, waiting for response
-  STATE_SPEAKING,     // Playing back TTS audio
-  STATE_SHOWING,      // Showing HA action result on screen
-  STATE_ERROR         // Error state (temporary)
+  STATE_BOOT,
+  STATE_LISTENING,
+  STATE_RECORDING,
+  STATE_PROCESSING,
+  STATE_SPEAKING,
+  STATE_SHOWING,
+  STATE_ERROR
 } device_state_t;
 volatile device_state_t device_state = STATE_BOOT;
 
@@ -63,68 +66,73 @@ static unsigned long     rec_start_time = 0;
 static i2s_chan_handle_t  tx_chan    = NULL;
 
 // ─── Volume (knob controlled) ────────────────────────
-static volatile int volume = 80;  // 0-100
+static volatile int volume = 80;
 static volatile int encoder_pos = 80;
-static int last_encoder_a = HIGH;
 
 // ─── UI handles ───────────────────────────────────────
 static lv_obj_t *ui_screen       = NULL;
-static lv_obj_t *ui_ring_outer   = NULL;
-static lv_obj_t *ui_ring_middle  = NULL;
-static lv_obj_t *ui_ring_inner   = NULL;
-static lv_obj_t *ui_core         = NULL;
-static lv_obj_t *ui_name_label   = NULL;
-static lv_obj_t *ui_status_label = NULL;
-static lv_obj_t *ui_info_label   = NULL;
+static lv_obj_t *ui_ring         = NULL;   // Single main ring
+static lv_obj_t *ui_center       = NULL;   // Dark center area
+static lv_obj_t *ui_name_label   = NULL;   // "7akim"
+static lv_obj_t *ui_status_label = NULL;   // "Tap to talk" / status
+static lv_obj_t *ui_btn          = NULL;   // Bottom pill button
+static lv_obj_t *ui_btn_label    = NULL;   // Button text
+static lv_obj_t *ui_response_label = NULL; // Response text overlay
 static lv_obj_t *ui_vol_bar      = NULL;
 static lv_obj_t *ui_vol_label    = NULL;
-static lv_obj_t *ui_btn          = NULL;
-static lv_obj_t *ui_btn_label    = NULL;
-static lv_obj_t *ui_response_label = NULL;
 
 // ─── Animation state ─────────────────────────────────
 static lv_timer_t *anim_timer    = NULL;
 static uint8_t     anim_phase    = 0;
-static bool        pulse_growing = true;
 
 // ─── Colors ──────────────────────────────────────────
 #define COL_BG          0x0a0a0f
-#define COL_CORE_IDLE   0x0d1b2a
-#define COL_RING_IDLE   0x1b2838
-#define COL_ACCENT_CYAN 0x00d4ff
-#define COL_ACCENT_GREEN 0x00ff88
-#define COL_LISTENING   0x00d4ff
+#define COL_RING_CYAN   0x00d4ff
+#define COL_RING_DIM    0x0a3040
+#define COL_CENTER_BG   0x0c1520
 #define COL_RECORDING   0xff3333
 #define COL_PROCESSING  0xff9500
 #define COL_SPEAKING    0x00ff88
 #define COL_ERROR       0xff4444
-#define COL_TEXT_DIM    0x556677
-#define COL_TEXT_BRIGHT 0xeeffff
+#define COL_TEXT_WHITE  0xffffff
+#define COL_TEXT_DIM    0x88aacc
+#define COL_BTN_BG     0x00d4ff
+#define COL_BTN_TEXT   0x0a0a0f
 
 // ─── Thread-safe UI helpers ──────────────────────────
-void ui_set_status(const char *status_txt, uint32_t ring_color) {
+void ui_set_status(const char *text, uint32_t ring_color) {
   lvgl_acquire();
-  if (ui_status_label) lv_label_set_text(ui_status_label, status_txt);
-  if (ui_ring_inner) {
-    lv_obj_set_style_border_color(ui_ring_inner, lv_color_hex(ring_color), 0);
-    lv_obj_set_style_shadow_color(ui_ring_inner, lv_color_hex(ring_color), 0);
-  }
-  if (ui_ring_middle) {
-    lv_obj_set_style_border_color(ui_ring_middle, lv_color_hex(ring_color), 0);
+  if (ui_status_label) lv_label_set_text(ui_status_label, text);
+  if (ui_ring) {
+    lv_obj_set_style_border_color(ui_ring, lv_color_hex(ring_color), 0);
+    lv_obj_set_style_shadow_color(ui_ring, lv_color_hex(ring_color), 0);
   }
   lvgl_release();
 }
 
-void ui_set_info(const char *info_txt) {
+void ui_set_name(const char *text) {
   lvgl_acquire();
-  if (ui_info_label) lv_label_set_text(ui_info_label, info_txt);
+  if (ui_name_label) lv_label_set_text(ui_name_label, text);
   lvgl_release();
 }
 
-void ui_set_response(const char *resp_txt) {
+void ui_set_btn_text(const char *text) {
+  lvgl_acquire();
+  if (ui_btn_label) lv_label_set_text(ui_btn_label, text);
+  lvgl_release();
+}
+
+void ui_set_btn_color(uint32_t bg_color, uint32_t text_color) {
+  lvgl_acquire();
+  if (ui_btn) lv_obj_set_style_bg_color(ui_btn, lv_color_hex(bg_color), 0);
+  if (ui_btn_label) lv_obj_set_style_text_color(ui_btn_label, lv_color_hex(text_color), 0);
+  lvgl_release();
+}
+
+void ui_set_response(const char *text) {
   lvgl_acquire();
   if (ui_response_label) {
-    lv_label_set_text(ui_response_label, resp_txt);
+    lv_label_set_text(ui_response_label, text);
     lv_obj_clear_flag(ui_response_label, LV_OBJ_FLAG_HIDDEN);
   }
   lvgl_release();
@@ -151,39 +159,37 @@ void ui_update_volume() {
 
 // ─── Pulse animation callback ────────────────────────
 static void anim_timer_cb(lv_timer_t *timer) {
-  if (device_state != STATE_LISTENING && device_state != STATE_RECORDING) return;
-  
   anim_phase = (anim_phase + 1) % 60;
-  
+  float sine_val = sin(anim_phase * 3.14159f / 30.0f);
+
   lvgl_acquire();
-  
+
   if (device_state == STATE_LISTENING) {
-    // Gentle breathing pulse on outer ring
-    uint8_t alpha = 80 + (uint8_t)(40.0f * sin(anim_phase * 3.14159f / 30.0f));
-    if (ui_ring_outer) {
-      lv_obj_set_style_border_opa(ui_ring_outer, alpha, 0);
-    }
-    // Subtle shadow pulse on inner ring
-    uint8_t shadow = 15 + (uint8_t)(10.0f * sin(anim_phase * 3.14159f / 30.0f));
-    if (ui_ring_inner) {
-      lv_obj_set_style_shadow_width(ui_ring_inner, shadow, 0);
+    // Gentle breathing glow on the ring
+    uint8_t shadow_w = 15 + (uint8_t)(10.0f * sine_val);
+    uint8_t border_opa = 180 + (uint8_t)(50.0f * sine_val);
+    if (ui_ring) {
+      lv_obj_set_style_shadow_width(ui_ring, shadow_w, 0);
+      lv_obj_set_style_border_opa(ui_ring, border_opa, 0);
     }
   } else if (device_state == STATE_RECORDING) {
-    // Fast pulse — red glow
-    uint8_t alpha = 120 + (uint8_t)(80.0f * sin(anim_phase * 3.14159f / 15.0f));
-    if (ui_ring_outer) {
-      lv_obj_set_style_border_opa(ui_ring_outer, alpha, 0);
-      lv_obj_set_style_border_color(ui_ring_outer, lv_color_hex(COL_RECORDING), 0);
+    // Fast red pulse
+    uint8_t shadow_w = 20 + (uint8_t)(15.0f * sin(anim_phase * 3.14159f / 10.0f));
+    if (ui_ring) {
+      lv_obj_set_style_shadow_width(ui_ring, shadow_w, 0);
     }
-    if (ui_ring_inner) {
-      lv_obj_set_style_shadow_width(ui_ring_inner, 20 + (anim_phase % 10), 0);
+  } else if (device_state == STATE_PROCESSING) {
+    // Orange spinning feel — pulsing shadow
+    uint8_t shadow_w = 10 + (uint8_t)(20.0f * sine_val);
+    if (ui_ring) {
+      lv_obj_set_style_shadow_width(ui_ring, shadow_w, 0);
     }
   }
-  
+
   lvgl_release();
 }
 
-// ─── Build the Jarvis-style UI ───────────────────────
+// ─── Build the clean minimal UI ──────────────────────
 void build_ui() {
   lvgl_acquire();
 
@@ -191,85 +197,67 @@ void build_ui() {
   lv_obj_set_style_bg_color(ui_screen, lv_color_hex(COL_BG), 0);
   lv_obj_set_style_bg_opa(ui_screen, LV_OPA_COVER, 0);
 
-  // ── Outer ring (subtle pulse ring) ──
-  ui_ring_outer = lv_obj_create(ui_screen);
-  lv_obj_set_size(ui_ring_outer, 280, 280);
-  lv_obj_align(ui_ring_outer, LV_ALIGN_CENTER, 0, -25);
-  lv_obj_set_style_radius(ui_ring_outer, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_opa(ui_ring_outer, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(ui_ring_outer, 1, 0);
-  lv_obj_set_style_border_color(ui_ring_outer, lv_color_hex(COL_ACCENT_CYAN), 0);
-  lv_obj_set_style_border_opa(ui_ring_outer, 80, 0);
-  lv_obj_clear_flag(ui_ring_outer, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+  // ── Single main ring (cyan glowing circle) ──
+  // Positioned slightly above center to leave room for button
+  ui_ring = lv_obj_create(ui_screen);
+  lv_obj_set_size(ui_ring, 210, 210);
+  lv_obj_align(ui_ring, LV_ALIGN_CENTER, 0, -30);
+  lv_obj_set_style_radius(ui_ring, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(ui_ring, lv_color_hex(COL_CENTER_BG), 0);
+  lv_obj_set_style_bg_opa(ui_ring, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(ui_ring, 3, 0);
+  lv_obj_set_style_border_color(ui_ring, lv_color_hex(COL_RING_CYAN), 0);
+  lv_obj_set_style_border_opa(ui_ring, 200, 0);
+  lv_obj_set_style_shadow_width(ui_ring, 20, 0);
+  lv_obj_set_style_shadow_color(ui_ring, lv_color_hex(COL_RING_CYAN), 0);
+  lv_obj_set_style_shadow_opa(ui_ring, 120, 0);
+  lv_obj_set_style_shadow_spread(ui_ring, 3, 0);
+  lv_obj_clear_flag(ui_ring, LV_OBJ_FLAG_SCROLLABLE);
 
-  // ── Middle ring ──
-  ui_ring_middle = lv_obj_create(ui_screen);
-  lv_obj_set_size(ui_ring_middle, 240, 240);
-  lv_obj_align(ui_ring_middle, LV_ALIGN_CENTER, 0, -25);
-  lv_obj_set_style_radius(ui_ring_middle, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_opa(ui_ring_middle, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(ui_ring_middle, 2, 0);
-  lv_obj_set_style_border_color(ui_ring_middle, lv_color_hex(COL_ACCENT_CYAN), 0);
-  lv_obj_set_style_border_opa(ui_ring_middle, 120, 0);
-  lv_obj_clear_flag(ui_ring_middle, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
-
-  // ── Inner ring (main glow ring) ──
-  ui_ring_inner = lv_obj_create(ui_screen);
-  lv_obj_set_size(ui_ring_inner, 200, 200);
-  lv_obj_align(ui_ring_inner, LV_ALIGN_CENTER, 0, -25);
-  lv_obj_set_style_radius(ui_ring_inner, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_color(ui_ring_inner, lv_color_hex(COL_CORE_IDLE), 0);
-  lv_obj_set_style_bg_opa(ui_ring_inner, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(ui_ring_inner, 3, 0);
-  lv_obj_set_style_border_color(ui_ring_inner, lv_color_hex(COL_ACCENT_CYAN), 0);
-  lv_obj_set_style_shadow_width(ui_ring_inner, 20, 0);
-  lv_obj_set_style_shadow_color(ui_ring_inner, lv_color_hex(COL_ACCENT_CYAN), 0);
-  lv_obj_set_style_shadow_opa(ui_ring_inner, 150, 0);
-  lv_obj_clear_flag(ui_ring_inner, LV_OBJ_FLAG_SCROLLABLE);
-
-  // ── Core circle (dark center) ──
-  ui_core = lv_obj_create(ui_ring_inner);
-  lv_obj_set_size(ui_core, 160, 160);
-  lv_obj_center(ui_core);
-  lv_obj_set_style_radius(ui_core, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_color(ui_core, lv_color_hex(0x060810), 0);
-  lv_obj_set_style_bg_opa(ui_core, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(ui_core, 0, 0);
-  lv_obj_clear_flag(ui_core, LV_OBJ_FLAG_SCROLLABLE);
-
-  // ── Name label ──
-  ui_name_label = lv_label_create(ui_core);
-  lv_label_set_text(ui_name_label, "7AKIM");
+  // ── Name label: "7akim" ──
+  ui_name_label = lv_label_create(ui_ring);
+  lv_label_set_text(ui_name_label, "7akim");
   lv_obj_set_style_text_font(ui_name_label, &lv_font_montserrat_28, 0);
-  lv_obj_set_style_text_color(ui_name_label, lv_color_hex(COL_ACCENT_CYAN), 0);
-  lv_obj_set_style_text_letter_space(ui_name_label, 4, 0);
-  lv_obj_align(ui_name_label, LV_ALIGN_CENTER, 0, -20);
+  lv_obj_set_style_text_color(ui_name_label, lv_color_hex(COL_TEXT_WHITE), 0);
+  lv_obj_set_style_text_letter_space(ui_name_label, 2, 0);
+  lv_obj_align(ui_name_label, LV_ALIGN_CENTER, 0, -12);
 
-  // ── Status label ──
-  ui_status_label = lv_label_create(ui_core);
-  lv_label_set_text(ui_status_label, "BOOTING");
+  // ── Status label: "Tap to talk" ──
+  ui_status_label = lv_label_create(ui_ring);
+  lv_label_set_text(ui_status_label, "Booting...");
   lv_obj_set_style_text_font(ui_status_label, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(ui_status_label, lv_color_hex(COL_TEXT_DIM), 0);
-  lv_obj_set_style_text_letter_space(ui_status_label, 2, 0);
-  lv_obj_align(ui_status_label, LV_ALIGN_CENTER, 0, 10);
+  lv_obj_align(ui_status_label, LV_ALIGN_CENTER, 0, 18);
 
-  // ── Info label (small, below status) ──
-  ui_info_label = lv_label_create(ui_core);
-  lv_label_set_text(ui_info_label, "");
-  lv_obj_set_style_text_font(ui_info_label, &lv_font_montserrat_12, 0);
-  lv_obj_set_style_text_color(ui_info_label, lv_color_hex(COL_TEXT_DIM), 0);
-  lv_obj_align(ui_info_label, LV_ALIGN_CENTER, 0, 30);
+  // ── Bottom pill button: "Hold to Talk" ──
+  ui_btn = lv_btn_create(ui_screen);
+  lv_obj_set_size(ui_btn, 200, 42);
+  lv_obj_align(ui_btn, LV_ALIGN_BOTTOM_MID, 0, -15);
+  lv_obj_set_style_radius(ui_btn, 21, 0);  // Fully rounded pill
+  lv_obj_set_style_bg_color(ui_btn, lv_color_hex(COL_BTN_BG), LV_STATE_DEFAULT);
+  lv_obj_set_style_bg_opa(ui_btn, 220, LV_STATE_DEFAULT);
+  lv_obj_set_style_bg_color(ui_btn, lv_color_hex(COL_RECORDING), LV_STATE_PRESSED);
+  lv_obj_set_style_border_width(ui_btn, 0, 0);
+  lv_obj_set_style_shadow_width(ui_btn, 15, 0);
+  lv_obj_set_style_shadow_color(ui_btn, lv_color_hex(COL_BTN_BG), 0);
+  lv_obj_set_style_shadow_opa(ui_btn, 100, 0);
 
-  // ── Volume bar (bottom left arc area) ──
+  ui_btn_label = lv_label_create(ui_btn);
+  lv_label_set_text(ui_btn_label, LV_SYMBOL_AUDIO "  Hold to Talk");
+  lv_obj_set_style_text_font(ui_btn_label, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(ui_btn_label, lv_color_hex(COL_BTN_TEXT), 0);
+  lv_obj_center(ui_btn_label);
+
+  // ── Volume bar (small, bottom-left) ──
   ui_vol_bar = lv_bar_create(ui_screen);
-  lv_obj_set_size(ui_vol_bar, 100, 6);
-  lv_obj_align(ui_vol_bar, LV_ALIGN_BOTTOM_LEFT, 20, -55);
+  lv_obj_set_size(ui_vol_bar, 80, 4);
+  lv_obj_align(ui_vol_bar, LV_ALIGN_BOTTOM_LEFT, 15, -5);
   lv_bar_set_range(ui_vol_bar, 0, 100);
   lv_bar_set_value(ui_vol_bar, volume, LV_ANIM_OFF);
   lv_obj_set_style_bg_color(ui_vol_bar, lv_color_hex(0x1a1a2e), 0);
-  lv_obj_set_style_bg_color(ui_vol_bar, lv_color_hex(COL_ACCENT_CYAN), LV_PART_INDICATOR);
-  lv_obj_set_style_radius(ui_vol_bar, 3, 0);
-  lv_obj_set_style_radius(ui_vol_bar, 3, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(ui_vol_bar, lv_color_hex(COL_RING_CYAN), LV_PART_INDICATOR);
+  lv_obj_set_style_radius(ui_vol_bar, 2, 0);
+  lv_obj_set_style_radius(ui_vol_bar, 2, LV_PART_INDICATOR);
 
   ui_vol_label = lv_label_create(ui_screen);
   char vol_buf[16];
@@ -277,26 +265,7 @@ void build_ui() {
   lv_label_set_text(ui_vol_label, vol_buf);
   lv_obj_set_style_text_font(ui_vol_label, &lv_font_montserrat_10, 0);
   lv_obj_set_style_text_color(ui_vol_label, lv_color_hex(COL_TEXT_DIM), 0);
-  lv_obj_align(ui_vol_label, LV_ALIGN_BOTTOM_LEFT, 20, -63);
-
-  // ── Touch button (bottom) ──
-  ui_btn = lv_btn_create(ui_screen);
-  lv_obj_set_size(ui_btn, 180, 40);
-  lv_obj_align(ui_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
-  lv_obj_set_style_radius(ui_btn, 20, 0);
-  lv_obj_set_style_bg_color(ui_btn, lv_color_hex(0x0d1b2a), LV_STATE_DEFAULT);
-  lv_obj_set_style_bg_color(ui_btn, lv_color_hex(COL_RECORDING), LV_STATE_PRESSED);
-  lv_obj_set_style_border_width(ui_btn, 1, 0);
-  lv_obj_set_style_border_color(ui_btn, lv_color_hex(COL_ACCENT_CYAN), 0);
-  lv_obj_set_style_shadow_width(ui_btn, 8, 0);
-  lv_obj_set_style_shadow_color(ui_btn, lv_color_hex(COL_ACCENT_CYAN), 0);
-  lv_obj_set_style_shadow_opa(ui_btn, 80, 0);
-
-  ui_btn_label = lv_label_create(ui_btn);
-  lv_label_set_text(ui_btn_label, LV_SYMBOL_AUDIO "  Say 'Jarvis'");
-  lv_obj_set_style_text_font(ui_btn_label, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(ui_btn_label, lv_color_hex(COL_ACCENT_CYAN), 0);
-  lv_obj_center(ui_btn_label);
+  lv_obj_align(ui_vol_label, LV_ALIGN_BOTTOM_RIGHT, -15, -3);
 
   // ── Response overlay label (hidden by default) ──
   ui_response_label = lv_label_create(ui_screen);
@@ -304,12 +273,12 @@ void build_ui() {
   lv_label_set_long_mode(ui_response_label, LV_LABEL_LONG_WRAP);
   lv_obj_set_width(ui_response_label, 300);
   lv_obj_set_style_text_font(ui_response_label, &lv_font_montserrat_12, 0);
-  lv_obj_set_style_text_color(ui_response_label, lv_color_hex(COL_ACCENT_GREEN), 0);
+  lv_obj_set_style_text_color(ui_response_label, lv_color_hex(COL_SPEAKING), 0);
   lv_obj_set_style_text_align(ui_response_label, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_align(ui_response_label, LV_ALIGN_TOP_MID, 0, 5);
   lv_obj_add_flag(ui_response_label, LV_OBJ_FLAG_HIDDEN);
 
-  // ── Start animation timer ──
+  // ── Start animation timer (50ms = 20fps) ──
   anim_timer = lv_timer_create(anim_timer_cb, 50, NULL);
 
   lvgl_release();
@@ -326,12 +295,6 @@ void onSrEvent(sr_event_t event, int command_id, int phrase_id) {
       break;
     case SR_EVENT_WAKEWORD_CHANNEL:
       Serial.printf("[7akim] Wake word channel verified (phrase_id=%d)\n", phrase_id);
-      break;
-    case SR_EVENT_COMMAND:
-      Serial.printf("[7akim] Command detected: id=%d\n", command_id);
-      break;
-    case SR_EVENT_TIMEOUT:
-      Serial.println("[7akim] SR timeout");
       break;
     default:
       break;
@@ -414,33 +377,33 @@ void init_microphone() {
 
 // ─── WAV builder ─────────────────────────────────────
 void build_wav_header(uint8_t *h, uint32_t pcm_bytes) {
-  uint32_t total=pcm_bytes+36, br=SAMPLE_RATE*2;
-  uint16_t pt=1, ch=1, ba=2, bd=16; uint32_t sr=SAMPLE_RATE, fs=16;
-  memcpy(h,"RIFF",4); memcpy(h+4,&total,4); memcpy(h+8,"WAVE",4);
-  memcpy(h+12,"fmt ",4); memcpy(h+16,&fs,4); memcpy(h+20,&pt,2);
-  memcpy(h+22,&ch,2); memcpy(h+24,&sr,4); memcpy(h+28,&br,4);
-  memcpy(h+32,&ba,2); memcpy(h+34,&bd,2);
-  memcpy(h+36,"data",4); memcpy(h+40,&pcm_bytes,4);
+  uint32_t total = pcm_bytes + 36, br = SAMPLE_RATE * 2;
+  uint16_t pt = 1, ch = 1, ba = 2, bd = 16;
+  uint32_t sr = SAMPLE_RATE, fs = 16;
+  memcpy(h, "RIFF", 4); memcpy(h + 4, &total, 4); memcpy(h + 8, "WAVE", 4);
+  memcpy(h + 12, "fmt ", 4); memcpy(h + 16, &fs, 4); memcpy(h + 20, &pt, 2);
+  memcpy(h + 22, &ch, 2); memcpy(h + 24, &sr, 4); memcpy(h + 28, &br, 4);
+  memcpy(h + 32, &ba, 2); memcpy(h + 34, &bd, 2);
+  memcpy(h + 36, "data", 4); memcpy(h + 40, &pcm_bytes, 4);
 }
 
 // ─── Volume-adjusted playback ────────────────────────
 void play_audio(uint8_t *data, size_t len) {
-  // Apply volume scaling to PCM data
-  int16_t *samples = (int16_t*)data;
+  int16_t *samples = (int16_t *)data;
   size_t num_samples = len / 2;
   float vol_scale = volume / 100.0f;
-  
+
   for (size_t i = 0; i < num_samples; i++) {
     int32_t s = (int32_t)(samples[i] * vol_scale);
     if (s > 32767) s = 32767;
     if (s < -32768) s = -32768;
     samples[i] = (int16_t)s;
   }
-  
-  size_t written=0, offset=0;
+
+  size_t written = 0, offset = 0;
   while (offset < len) {
-    size_t chunk = min((size_t)2048, len-offset);
-    i2s_channel_write(tx_chan, data+offset, chunk, &written, 1000);
+    size_t chunk = min((size_t)2048, len - offset);
+    i2s_channel_write(tx_chan, data + offset, chunk, &written, 1000);
     offset += written;
   }
 }
@@ -450,15 +413,18 @@ bool send_and_play() {
   if (rec_bytes < 2000) return false;
 
   uint32_t wav_size = rec_bytes + 44;
-  uint8_t *wav = (uint8_t*)heap_caps_malloc(wav_size, MALLOC_CAP_SPIRAM);
+  uint8_t *wav = (uint8_t *)heap_caps_malloc(wav_size, MALLOC_CAP_SPIRAM);
   if (!wav) return false;
   build_wav_header(wav, rec_bytes);
-  memcpy(wav+44, rec_buf, rec_bytes);
+  memcpy(wav + 44, rec_buf, rec_bytes);
 
   HTTPClient http;
   http.begin(String("http://") + SERVER_HOST + ":" + SERVER_PORT + "/voice");
   http.addHeader("Content-Type", "audio/wav");
   http.setTimeout(30000);
+  // Collect response headers
+  const char *headerKeys[] = {"X-7akim-Text", "X-7akim-HA-Action"};
+  http.collectHeaders(headerKeys, 2);
   int code = http.POST(wav, wav_size);
   heap_caps_free(wav);
 
@@ -468,41 +434,40 @@ bool send_and_play() {
     return false;
   }
 
-  // Check for X-7akim-Text header (response text for display)
+  // Display response text and HA action
   String response_text = http.header("X-7akim-Text");
   String ha_action = http.header("X-7akim-HA-Action");
-  
+
   if (response_text.length() > 0) {
     Serial.printf("[7akim] Response: %s\n", response_text.c_str());
-    // Truncate for display
     if (response_text.length() > 80) {
       response_text = response_text.substring(0, 77) + "...";
     }
     ui_set_response(response_text.c_str());
   }
-  
+
   if (ha_action.length() > 0) {
     Serial.printf("[7akim] HA Action: %s\n", ha_action.c_str());
-    ui_set_info(ha_action.c_str());
   }
 
+  // Stream and play audio response
   int plen = http.getSize();
   if (plen > 0 && plen < (int)AUDIO_BUF_SIZE) {
-    uint8_t *resp = (uint8_t*)heap_caps_malloc(plen, MALLOC_CAP_SPIRAM);
+    uint8_t *resp = (uint8_t *)heap_caps_malloc(plen, MALLOC_CAP_SPIRAM);
     if (resp) {
       WiFiClient *stream = http.getStreamPtr();
       size_t got = 0;
       unsigned long t = millis();
-      while (got < (size_t)plen && millis()-t < 20000) {
+      while (got < (size_t)plen && millis() - t < 20000) {
         int av = stream->available();
-        if (av>0) got += stream->readBytes(resp+got, av);
+        if (av > 0) got += stream->readBytes(resp + got, av);
         else delay(1);
       }
+
       device_state = STATE_SPEAKING;
-      ui_set_status("SPEAKING", COL_SPEAKING);
-      lvgl_acquire();
-      if (ui_btn_label) lv_label_set_text(ui_btn_label, LV_SYMBOL_PLAY "  Speaking...");
-      lvgl_release();
+      ui_set_status("Speaking...", COL_SPEAKING);
+      ui_set_btn_text(LV_SYMBOL_PLAY "  Speaking...");
+      ui_set_btn_color(COL_SPEAKING, COL_BTN_TEXT);
       play_audio(resp, got);
       heap_caps_free(resp);
     }
@@ -514,14 +479,13 @@ bool send_and_play() {
 // ─── Record audio chunk ──────────────────────────────
 void record_audio_chunk() {
   if (rec_bytes + 1024 <= AUDIO_BUF_SIZE) {
-    size_t got = i2s_mic.readBytes((char*)rec_buf + rec_bytes, 1024);
+    size_t got = i2s_mic.readBytes((char *)rec_buf + rec_bytes, 1024);
     rec_bytes += got;
   }
 }
 
 // ─── Voice task (main state machine) ──────────────────
 void voice_task(void *arg) {
-  
   for (;;) {
     switch (device_state) {
 
@@ -544,18 +508,14 @@ void voice_task(void *arg) {
           device_state = STATE_RECORDING;
           ui_hide_response();
 
-          ui_set_status("LISTENING", COL_RECORDING);
-          lvgl_acquire();
+          // Update UI for recording
+          ui_set_status("Listening...", COL_RECORDING);
+          ui_set_btn_color(COL_RECORDING, COL_TEXT_WHITE);
           if (from_wakeword) {
-            if (ui_btn_label) lv_label_set_text(ui_btn_label, LV_SYMBOL_STOP "  Speak now...");
+            ui_set_btn_text(LV_SYMBOL_STOP "  Speak now...");
           } else {
-            if (ui_btn_label) lv_label_set_text(ui_btn_label, LV_SYMBOL_STOP "  Release to send");
+            ui_set_btn_text(LV_SYMBOL_STOP "  Release to send");
           }
-          // Reset outer ring color for recording animation
-          if (ui_ring_outer) {
-            lv_obj_set_style_border_color(ui_ring_outer, lv_color_hex(COL_RECORDING), 0);
-          }
-          lvgl_release();
         }
         break;
       }
@@ -588,14 +548,9 @@ void voice_task(void *arg) {
 
         if (stop) {
           device_state = STATE_PROCESSING;
-          ui_set_status("THINKING", COL_PROCESSING);
-          lvgl_acquire();
-          if (ui_btn_label) lv_label_set_text(ui_btn_label, LV_SYMBOL_REFRESH "  Processing...");
-          // Reset ring colors
-          if (ui_ring_outer) {
-            lv_obj_set_style_border_color(ui_ring_outer, lv_color_hex(COL_ACCENT_CYAN), 0);
-          }
-          lvgl_release();
+          ui_set_status("Thinking...", COL_PROCESSING);
+          ui_set_btn_text(LV_SYMBOL_REFRESH "  Processing...");
+          ui_set_btn_color(COL_PROCESSING, COL_BTN_TEXT);
           Serial.printf("[7akim] Recorded %d bytes, sending to server\n", rec_bytes);
         }
         break;
@@ -605,26 +560,23 @@ void voice_task(void *arg) {
         if (send_and_play()) {
           // Show response for a few seconds then return to listening
           device_state = STATE_SHOWING;
-          ui_set_status("READY", COL_ACCENT_CYAN);
-          lvgl_acquire();
-          if (ui_btn_label) lv_label_set_text(ui_btn_label, LV_SYMBOL_AUDIO "  Say 'Jarvis'");
-          lvgl_release();
-          vTaskDelay(pdMS_TO_TICKS(4000));  // Show response text
+          ui_set_status("Tap to talk", COL_RING_CYAN);
+          ui_set_btn_text(LV_SYMBOL_AUDIO "  Hold to Talk");
+          ui_set_btn_color(COL_BTN_BG, COL_BTN_TEXT);
+          vTaskDelay(pdMS_TO_TICKS(4000));
           ui_hide_response();
-          ui_set_info("");
           device_state = STATE_LISTENING;
-          ui_set_status("AWAITING", COL_ACCENT_CYAN);
+          ui_set_status("Tap to talk", COL_RING_CYAN);
         } else {
           device_state = STATE_ERROR;
-          ui_set_status("ERROR", COL_ERROR);
-          ui_set_info("Server unreachable");
+          ui_set_status("Error", COL_ERROR);
+          ui_set_btn_text("Server error");
+          ui_set_btn_color(COL_ERROR, COL_TEXT_WHITE);
           vTaskDelay(pdMS_TO_TICKS(2000));
-          ui_set_info("");
           device_state = STATE_LISTENING;
-          ui_set_status("AWAITING", COL_ACCENT_CYAN);
-          lvgl_acquire();
-          if (ui_btn_label) lv_label_set_text(ui_btn_label, LV_SYMBOL_AUDIO "  Say 'Jarvis'");
-          lvgl_release();
+          ui_set_status("Tap to talk", COL_RING_CYAN);
+          ui_set_btn_text(LV_SYMBOL_AUDIO "  Hold to Talk");
+          ui_set_btn_color(COL_BTN_BG, COL_BTN_TEXT);
         }
 
         ESP_SR.resume();
@@ -643,8 +595,8 @@ void voice_task(void *arg) {
 void setup() {
   Serial.begin(115200);
   Serial.println("\n[7akim] ═══════════════════════════════════════");
-  Serial.println("[7akim]   7akim Voice Assistant v2.0");
-  Serial.println("[7akim]   Wake word: 'Jarvis' (WakeNet9)");
+  Serial.println("[7akim]   7akim Voice Assistant v2.1");
+  Serial.println("[7akim]   Wake word: 'Jarvis' (WakeNet9 only)");
   Serial.println("[7akim]   Home Assistant Integration");
   Serial.println("[7akim] ═══════════════════════════════════════");
 
@@ -655,15 +607,14 @@ void setup() {
   vTaskDelay(pdMS_TO_TICKS(300));
 
   build_ui();
-  ui_set_status("BOOTING", COL_PROCESSING);
+  ui_set_status("Booting...", COL_PROCESSING);
 
   // ── Encoder pins ──
   pinMode(ENCODER_A_PIN, INPUT_PULLUP);
   pinMode(ENCODER_B_PIN, INPUT_PULLUP);
 
   // ── WiFi ──
-  ui_set_status("WIFI", COL_PROCESSING);
-  ui_set_info("Connecting...");
+  ui_set_status("Connecting WiFi...", COL_PROCESSING);
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   int tries = 0;
@@ -673,22 +624,20 @@ void setup() {
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("[7akim] WiFi connected: %s\n", WiFi.localIP().toString().c_str());
-    ui_set_status("ONLINE", COL_ACCENT_GREEN);
-    ui_set_info(WiFi.localIP().toString().c_str());
-    vTaskDelay(pdMS_TO_TICKS(1500));
+    ui_set_status("Online", COL_SPEAKING);
+    vTaskDelay(pdMS_TO_TICKS(1000));
   } else {
     Serial.println("[7akim] WiFi connection failed!");
-    ui_set_status("NO WIFI", COL_ERROR);
-    ui_set_info("Check config");
+    ui_set_status("No WiFi", COL_ERROR);
     vTaskDelay(pdMS_TO_TICKS(2000));
   }
 
   // ── Audio buffer (PSRAM) ──
-  rec_buf = (int16_t*)heap_caps_malloc(AUDIO_BUF_SIZE, MALLOC_CAP_SPIRAM);
+  rec_buf = (int16_t *)heap_caps_malloc(AUDIO_BUF_SIZE, MALLOC_CAP_SPIRAM);
   if (!rec_buf) {
     Serial.println("[7akim] PSRAM allocation failed!");
-    ui_set_status("PSRAM FAIL", COL_ERROR);
-    while(1) vTaskDelay(pdMS_TO_TICKS(1000));
+    ui_set_status("Memory Error", COL_ERROR);
+    while (1) vTaskDelay(pdMS_TO_TICKS(1000));
   }
   Serial.printf("[7akim] Audio buffer: %d bytes in PSRAM\n", AUDIO_BUF_SIZE);
 
@@ -699,27 +648,25 @@ void setup() {
   // ── Microphone ──
   init_microphone();
 
-  // ── ESP_SR Wake Word Engine ──
-  ui_set_status("WAKENET", COL_PROCESSING);
-  ui_set_info("Loading model...");
-  Serial.println("[7akim] Initializing ESP_SR with 'Jarvis' wake word...");
+  // ── ESP_SR Wake Word Engine (WakeNet only, NO MultiNet) ──
+  ui_set_status("Loading model...", COL_PROCESSING);
+  Serial.println("[7akim] Initializing ESP_SR (WakeNet only, no MultiNet)...");
 
   ESP_SR.onEvent(onSrEvent);
+  // Pass 0 commands and SR_MODE_WAKEWORD to skip MultiNet entirely
   bool sr_ok = ESP_SR.begin(
     i2s_mic,
     sr_commands,
-    sizeof(sr_commands) / sizeof(sr_cmd_t),
+    0,                    // Zero commands = skip MultiNet
     SR_CHANNELS_MONO,
-    SR_MODE_WAKEWORD,
-    "MN"
+    SR_MODE_WAKEWORD      // WakeNet only mode
   );
 
   if (sr_ok) {
-    Serial.println("[7akim] ESP_SR started successfully!");
+    Serial.println("[7akim] WakeNet started successfully! Listening for 'Jarvis'...");
   } else {
-    Serial.println("[7akim] ESP_SR failed! Touch-only mode.");
-    ui_set_status("NO WAKENET", COL_ERROR);
-    ui_set_info("Touch to talk");
+    Serial.println("[7akim] WakeNet failed! Touch-only mode.");
+    ui_set_status("No wake word", COL_ERROR);
     vTaskDelay(pdMS_TO_TICKS(2000));
   }
 
@@ -728,8 +675,8 @@ void setup() {
 
   // ── Ready ──
   device_state = STATE_LISTENING;
-  ui_set_status("AWAITING", COL_ACCENT_CYAN);
-  ui_set_info("Say 'Jarvis'");
+  ui_set_status("Tap to talk", COL_RING_CYAN);
+  ui_set_btn_text(LV_SYMBOL_AUDIO "  Hold to Talk");
   Serial.println("[7akim] Ready! Say 'Jarvis' or touch the screen.");
 
   // ── Tasks ──
